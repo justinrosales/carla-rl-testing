@@ -18,16 +18,21 @@
 # ==============================================================================
 
 import argparse
+import glob
 import json
 import os
+import struct
 import sys
 import time
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 
 import gym
 import gym_carla
+import matplotlib
+matplotlib.use("Agg")  # headless backend — no display required
+import matplotlib.pyplot as plt
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -375,6 +380,249 @@ def save_results(results, output_dir):
 
 
 # ==============================================================================
+# Graph / Visualisation Helpers
+# ==============================================================================
+
+# ---- Colour palette (colourblind-friendly, modern) ----
+_PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52",
+            "#8172B3", "#937860", "#DA8BC3", "#8C8C8C"]
+
+
+def _style_axis(ax, title, xlabel, ylabel):
+    """Apply a consistent visual style to a matplotlib axis."""
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(labelsize=10)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+
+# --------------------------------------------------------------------------- #
+#  1. Rewards
+# --------------------------------------------------------------------------- #
+
+def plot_rewards(results, output_dir):
+    """
+    Generate reward visualisations:
+      - Bar chart of mean reward per algorithm (with std error bars)
+      - Grouped per-episode reward breakdown
+    Saves PNGs into <output_dir>/graphs/.
+    """
+    graphs_dir = os.path.join(output_dir, "graphs")
+    os.makedirs(graphs_dir, exist_ok=True)
+
+    successful = [r for r in results if "error" not in r]
+    if not successful:
+        print("  [graphs] No successful results — skipping reward plots.")
+        return
+
+    names = [r["algorithm"] for r in successful]
+    means = [r["mean_reward"] for r in successful]
+    stds  = [r["std_reward"] for r in successful]
+    colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(names))]
+
+    # ---- Mean-reward bar chart ----
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(names, means, yerr=stds, capsize=5, color=colors,
+                  edgecolor="white", linewidth=0.8)
+    _style_axis(ax, "Mean Reward per Algorithm", "Algorithm", "Mean Reward")
+    # Value labels on top of bars
+    for bar, m in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{m:.1f}", ha="center", va="bottom", fontsize=9,
+                fontweight="bold")
+    fig.tight_layout()
+    path = os.path.join(graphs_dir, "reward_comparison.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [graphs] Saved {path}")
+
+    # ---- Per-episode breakdown ----
+    fig, ax = plt.subplots(figsize=(10, 6))
+    max_eps = max(len(r["episode_rewards"]) for r in successful)
+    x = np.arange(max_eps)
+    width = 0.8 / len(successful)
+    for idx, r in enumerate(successful):
+        rewards = r["episode_rewards"]
+        offsets = x[:len(rewards)] - 0.4 + idx * width + width / 2
+        ax.bar(offsets, rewards, width=width, label=r["algorithm"],
+               color=colors[idx], edgecolor="white", linewidth=0.5)
+    _style_axis(ax, "Per-Episode Rewards", "Episode", "Reward")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"Ep {i+1}" for i in range(max_eps)])
+    ax.legend(fontsize=10, framealpha=0.9)
+    fig.tight_layout()
+    path = os.path.join(graphs_dir, "reward_per_episode.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [graphs] Saved {path}")
+
+
+# --------------------------------------------------------------------------- #
+#  2. Loss (from TensorBoard event files)
+# --------------------------------------------------------------------------- #
+
+def _parse_tb_events(event_file):
+    """
+    Minimal TensorBoard event file parser.
+
+    Reads tf.Event records directly using the TFRecord format
+    (length-delimited protobuf), pulling out scalar summaries.
+    Returns dict: {tag: [(wall_time, step, value), ...]}.
+    """
+    scalars = defaultdict(list)
+    try:
+        # Try the tensorflow approach first (available with SB2)
+        import tensorflow as tf
+        for event in tf.compat.v1.train.summary_iterator(event_file):
+            for v in event.summary.value:
+                if v.HasField("simple_value"):
+                    scalars[v.tag].append(
+                        (event.wall_time, event.step, v.simple_value)
+                    )
+    except Exception:
+        # Fallback: skip if tensorflow is not importable
+        pass
+    return dict(scalars)
+
+
+def plot_loss(tb_dir, output_dir):
+    """
+    Parse TensorBoard event files and plot loss curves.
+    Searches for tags containing 'loss' (case-insensitive).
+    Saves PNG to <output_dir>/graphs/.
+    """
+    graphs_dir = os.path.join(output_dir, "graphs")
+    os.makedirs(graphs_dir, exist_ok=True)
+
+    event_files = glob.glob(os.path.join(tb_dir, "**", "events.out.tfevents.*"),
+                            recursive=True)
+    if not event_files:
+        print("  [graphs] No TensorBoard event files found — "
+              "skipping loss plot.")
+        return
+
+    # Collect loss scalars keyed by algo name
+    algo_losses = {}  # algo_name -> {tag: [(step, value), ...]}
+    for ef in event_files:
+        # Infer algo name from parent directory (e.g. "DQN_benchmark_1")
+        algo_label = os.path.basename(os.path.dirname(ef)).split("_")[0]
+        scalars = _parse_tb_events(ef)
+        loss_tags = {t: v for t, v in scalars.items()
+                     if "loss" in t.lower()}
+        if loss_tags:
+            algo_losses[algo_label] = {
+                t: [(s, val) for _, s, val in entries]
+                for t, entries in loss_tags.items()
+            }
+
+    if not algo_losses:
+        print("  [graphs] No loss scalars found in TensorBoard logs — "
+              "skipping loss plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    color_idx = 0
+    for algo, tags in sorted(algo_losses.items()):
+        for tag, points in tags.items():
+            points.sort(key=lambda p: p[0])
+            steps = [p[0] for p in points]
+            values = [p[1] for p in points]
+            ax.plot(steps, values,
+                    label=f"{algo} — {tag}",
+                    color=_PALETTE[color_idx % len(_PALETTE)],
+                    linewidth=1.5, alpha=0.85)
+            color_idx += 1
+
+    _style_axis(ax, "Training Loss over Timesteps", "Timestep", "Loss")
+    ax.legend(fontsize=9, loc="upper right", framealpha=0.9)
+    fig.tight_layout()
+    path = os.path.join(graphs_dir, "loss_curves.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [graphs] Saved {path}")
+
+
+# --------------------------------------------------------------------------- #
+#  3. Policy comparison
+# --------------------------------------------------------------------------- #
+
+def plot_policy_comparison(results, output_dir):
+    """
+    Generate policy-level comparison charts:
+      - Episode length bar chart (longer = better policy)
+      - Efficiency scatter: training wall-time vs mean reward
+    Saves PNGs to <output_dir>/graphs/.
+    """
+    graphs_dir = os.path.join(output_dir, "graphs")
+    os.makedirs(graphs_dir, exist_ok=True)
+
+    successful = [r for r in results if "error" not in r]
+    if not successful:
+        print("  [graphs] No successful results — "
+              "skipping policy comparison plots.")
+        return
+
+    names  = [r["algorithm"] for r in successful]
+    colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(names))]
+
+    # ---- Episode length comparison ----
+    mean_lens = [r["mean_length"] for r in successful]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(names, mean_lens, color=colors,
+                  edgecolor="white", linewidth=0.8)
+    _style_axis(ax, "Mean Episode Length per Algorithm (longer = better)",
+                "Algorithm", "Mean Episode Length (steps)")
+    for bar, ml in zip(bars, mean_lens):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{ml:.0f}", ha="center", va="bottom", fontsize=9,
+                fontweight="bold")
+    fig.tight_layout()
+    path = os.path.join(graphs_dir, "episode_length_comparison.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [graphs] Saved {path}")
+
+    # ---- Efficiency scatter ----
+    wall_times  = [r["train_wall_time_s"] for r in successful]
+    mean_rews   = [r["mean_reward"] for r in successful]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, (wt, mr, name) in enumerate(zip(wall_times, mean_rews, names)):
+        ax.scatter(wt, mr, s=120, color=colors[i], edgecolors="black",
+                   linewidth=0.6, zorder=3)
+        ax.annotate(name, (wt, mr), textcoords="offset points",
+                    xytext=(8, 6), fontsize=10, fontweight="bold")
+    _style_axis(ax, "Training Efficiency: Wall-Time vs Reward",
+                "Training Wall-Time (s)", "Mean Reward")
+    fig.tight_layout()
+    path = os.path.join(graphs_dir, "efficiency_scatter.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [graphs] Saved {path}")
+
+
+# --------------------------------------------------------------------------- #
+#  4. Orchestrator
+# --------------------------------------------------------------------------- #
+
+def generate_all_graphs(results, output_dir, tb_dir):
+    """Run every graph-generation function and print a summary."""
+    print(f"\n{'='*70}")
+    print("  GENERATING GRAPHS")
+    print(f"{'='*70}")
+
+    plot_rewards(results, output_dir)
+    plot_loss(tb_dir, output_dir)
+    plot_policy_comparison(results, output_dir)
+
+    graphs_dir = os.path.join(output_dir, "graphs")
+    pngs = glob.glob(os.path.join(graphs_dir, "*.png"))
+    print(f"\n  {len(pngs)} graph(s) saved to {graphs_dir}/")
+
+
+# ==============================================================================
 # CLI
 # ==============================================================================
 
@@ -435,6 +683,12 @@ Examples:
         default="./tensorboard",
         help="TensorBoard log directory (default: ./tensorboard)",
     )
+    parser.add_argument(
+        "--no-graphs",
+        action="store_true",
+        default=False,
+        help="Skip automatic graph generation after benchmarking",
+    )
     return parser.parse_args()
 
 
@@ -494,6 +748,10 @@ def main():
     # ---- Output ----
     print_results_table(results)
     save_results(results, args.output_dir)
+
+    # ---- Graphs ----
+    if not args.no_graphs:
+        generate_all_graphs(results, args.output_dir, args.tensorboard_dir)
 
     successful = sum(1 for r in results if "error" not in r)
     print(f"  Benchmark complete: {successful}/{len(selected)} algorithms "
